@@ -9,7 +9,8 @@ use git_internal::{hash::ObjectHash, internal::pack::Pack};
 
 fn main() {
     // replace with the path to your pack file
-    let pack_path = "tests/data/packs/small-sha1.pack";
+    // let pack_path = "tests/data/packs/small-sha1.pack";
+    let pack_path = "./work/pack-771511a13ec3909d3af565fb6909ce23ddd27c86.pack";
     if !Path::new(pack_path).exists() {
         println!("Pack file not found: {}, skipping example.", pack_path);
         return;
@@ -35,10 +36,10 @@ fn main() {
         |entry| {
             // Callback function: process each decoded object (Entry)
             // entry.inner contains the actual data, entry.meta contains metadata
-            println!(
-                "Decoded object: {} | Type: {:?}",
-                entry.inner.hash, entry.inner.obj_type
-            );
+            // println!(
+            //     "Decoded object: {} | Type: {:?}",
+            //     entry.inner.hash, entry.inner.obj_type
+            // );
         },
         None::<fn(ObjectHash)>, // Optional: callback for the overall Pack file Hash
     )

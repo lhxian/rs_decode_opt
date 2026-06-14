@@ -1,7 +1,7 @@
 //! Reader wrapper that tracks how many bytes of a pack have been consumed while keeping a running
 //! SHA-1/SHA-256 hash for trailer verification.
 
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
 
 use sha1::{Digest, Sha1};
 
@@ -22,6 +22,11 @@ pub struct Wrapper<R> {
     inner: R,
     hash: HashAlgorithm,
     bytes_read: usize,
+}
+impl<R: Seek> Seek for Wrapper<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
 }
 
 impl<R> Wrapper<R>

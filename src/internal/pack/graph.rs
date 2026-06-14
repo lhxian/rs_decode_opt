@@ -1,0 +1,334 @@
+use std::{
+    io::{self, BufRead, Cursor, ErrorKind, Read, Seek, SeekFrom},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    collections::HashMap,
+    time::Instant,
+    thread,
+};
+
+use flate2::bufread::ZlibDecoder;
+use futures::SinkExt;
+use sha1::{Digest, Sha1};
+use threadpool::ThreadPool;
+use crate::{
+    errors::GitError,
+    hash::{ObjectHash, HashKind, get_hash_kind, set_hash_kind},
+    internal::{
+        metadata::{EntryMeta, MetaAttached},
+        object::types::ObjectType,
+        pack::{
+            cache_object::{CacheObject, CacheObjectInfo, MemSizeRecorder},
+            utils,
+        },
+    },
+    utils::CountingReader,
+    zstdelta,
+};
+#[derive(Clone)]
+enum NodeValue {
+    Base(ObjectHash), // oid
+    OffsetDelta(usize), // base index in nodes
+    RefDelta(ObjectHash), // base hash
+}
+pub struct GraphNodeInfo {
+    pub offset: usize,
+    pub cur_child_idx: i32,
+    pub child: Option<Vec<usize>>, // child offset
+    pub value: NodeValue,
+}
+impl GraphNodeInfo {
+    pub fn new(offset: usize, value: NodeValue) -> Self {
+        Self{
+            offset,
+            cur_child_idx: 0,
+            child: None,
+            value: value,
+        }
+    }
+}
+pub struct DependGraph{
+    pub node_cnt: usize,
+    pub nodes: Vec<Mutex<GraphNodeInfo>>,
+
+    pub ref_list: HashMap<ObjectHash, Vec<usize>>, // ref, offset
+    pub file_buf: Vec<u8>,
+    pub work_list: Mutex<Vec<usize>>,
+    cur_pos: usize,
+}
+struct LightWeightReader<R> {
+    inner: R,
+    pub read_bytes: usize,
+}
+impl<R: Read> Read for LightWeightReader< R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n =self.inner.read(buf)?;
+        self.read_bytes += n;
+        Ok(n)
+    }
+}
+impl<R: BufRead> BufRead for LightWeightReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+        self.read_bytes += amt;
+    }
+
+}
+impl<R> LightWeightReader<R> {
+    pub fn clear(&mut self){
+        self.read_bytes = 0;
+    }
+}
+enum LightWeightHash{
+    Sha1(Sha1),
+    Sha256(sha2::Sha256),
+}
+impl LightWeightHash{
+    fn new() -> Self{
+        match get_hash_kind() {
+            HashKind::Sha1 => LightWeightHash::Sha1(Sha1::new()),
+            HashKind::Sha256 => LightWeightHash::Sha256(sha2::Sha256::new()),
+        }
+    }
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            LightWeightHash::Sha1(hasher) => hasher.update(data),
+            LightWeightHash::Sha256(hasher) => hasher.update(data),
+        }
+    }
+    fn get_hash(self) -> ObjectHash {
+        match self {
+            LightWeightHash::Sha1(hasher) => ObjectHash::Sha1(hasher.finalize().into()),
+            LightWeightHash::Sha256(hasher) => ObjectHash::Sha256(hasher.finalize().into()),
+        }
+    }
+}
+impl DependGraph {
+    const BUF_SIZE: usize =8192;
+    fn consume_base(
+        object_type: ObjectType,
+        expected_size: usize,
+        reader: &mut (impl BufRead + Read + Send),
+        buf: &mut [u8],
+    )-> ObjectHash  // oid, raw size, cached data
+    {
+        let mut deflate = ZlibDecoder::new(reader);
+        let mut hasher = LightWeightHash::new();
+        let type_bytes = object_type.to_bytes().unwrap();
+        hasher.update(type_bytes);
+        hasher.update(b" ");
+        hasher.update(expected_size.to_string().as_bytes());
+        hasher.update(b"\0");
+        loop {
+            let n = deflate.read(buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            // update hash
+            hasher.update(&buf[..n]);
+        }
+        hasher.get_hash()
+
+    }
+    fn consume_delta(
+        reader: &mut (impl BufRead + Read + Send),
+        buf: &mut [u8],
+    ){
+        let mut deflate= ZlibDecoder::new(reader);
+        loop {
+            let n = deflate.read(buf).unwrap();
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    pub fn build_graph(
+        pack: &mut( impl BufRead + Send + Seek),
+        object_number: usize,
+    )-> Self {
+        let cur =pack.seek(SeekFrom::Start(0)).unwrap();
+        let end =pack.seek(SeekFrom::End(0)).unwrap();
+        let mut graph = DependGraph {
+            node_cnt: object_number,
+            nodes: Vec::with_capacity(object_number),
+            ref_list: HashMap::new(),
+            file_buf : Vec::with_capacity((end - cur) as usize),
+            work_list: Mutex::new(Vec::with_capacity(object_number/2 +1)),
+            cur_pos: 0,
+        };
+        pack.seek(SeekFrom::Start(0)).unwrap();
+        pack.read_to_end(&mut graph.file_buf).unwrap();
+        println!("file buf len: {}", graph.file_buf.len());
+        println!("pack size: {}", end - cur);
+        let mut mem_reader = Cursor::new(&mut graph.file_buf[12..]);
+        let mut reader = LightWeightReader {
+            inner: mem_reader,
+            read_bytes: 0,
+        };
+        let mut buf: [u8;Self::BUF_SIZE] = [0;Self::BUF_SIZE];
+        let mut offset :usize= 12;
+        let hash_kind = get_hash_kind();
+        let mut delta_cnt =0;
+        let mut cache_cnt =0;
+        for i in 0..object_number {
+            let init_offset = offset;
+            let (type_bits, expected_size) = utils::read_type_and_varint_size(&mut reader, &mut offset).unwrap();
+            let t = ObjectType::from_pack_type_u8(type_bits).unwrap();
+            match t{
+                ObjectType::Commit | ObjectType::Tree | ObjectType::Blob | ObjectType::Tag => {
+                    // caculate the oid
+                    let type_byte = t.to_bytes().unwrap();
+                    let oid = Self::consume_base(t, expected_size, &mut reader, &mut buf);
+                    let mut base_item = GraphNodeInfo::new(init_offset, NodeValue::Base(oid));
+                    graph.nodes.push(Mutex::new(base_item));
+
+                }
+                ObjectType::OffsetDelta | ObjectType::OffsetZstdelta => {
+                    let (delta_offset, bytes) = utils::read_offset_encoding(&mut reader).unwrap();
+                    Self::consume_delta(&mut reader, &mut buf);
+                    let base_offset = init_offset - delta_offset as usize;
+                    // inc parent ref cnt
+                    let parent_idx = graph.nodes.binary_search_by(|x|{
+                        let v = x.lock().unwrap();
+                        v.offset.cmp(&base_offset)
+                    }).unwrap();
+                    {
+                        let mut parent = graph.nodes[parent_idx].lock().unwrap();
+                        match &mut parent.child {
+                            Some(child) => {
+                                child.push(i);
+                            }
+                            None => {
+                                parent.child = Some(vec![i]);
+                            }
+                        }
+                    }
+                    let mut delta_item = GraphNodeInfo::new(init_offset, NodeValue::OffsetDelta(parent_idx));
+                    graph.nodes.push(Mutex::new(delta_item));
+
+                }
+                ObjectType::HashDelta => {
+                    let ref_hash = ObjectHash::from_stream(&mut reader).unwrap();
+                    match graph.ref_list.get_mut(& ref_hash) {
+                        Some(list) => list.push(i),
+                        None => {
+                            graph.ref_list.insert(ref_hash, vec![i]);
+                        }
+                    }
+                    Self::consume_delta(&mut reader, &mut buf);
+                    let mut delta_item = GraphNodeInfo::new(init_offset, NodeValue::RefDelta(ref_hash));
+                    graph.nodes.push(Mutex::new(delta_item));
+
+                }
+                _ => {}
+            }
+            // update offset
+            offset = init_offset + reader.read_bytes;
+            reader.clear();
+        }
+        // check the mt deflate
+        graph
+    }
+    fn take_idx(&mut self) -> Option<usize> {
+        let mut wl = self.work_list.lock().unwrap();
+        if wl.len() > 0 {
+            return Some(wl.pop().unwrap());
+        }
+        let obj_cnt = self.nodes.len();
+        // get the next base object
+        while (self.cur_pos as usize) < obj_cnt {
+            let item = self.nodes[self.cur_pos as usize].lock().unwrap();
+            match &item.value {
+                NodeValue::Base(_) => {
+                    let pos = self.cur_pos;
+                    self.cur_pos += 1;
+                    return Some(pos);
+                }
+                _ => {}
+            }
+            self.cur_pos += 1;
+        }
+        None
+    }
+    // return (offset, value)
+    pub fn take_value(&mut self, idx:usize) -> (usize,NodeValue) {
+        let item = self.nodes[idx].lock().unwrap();
+        (item.offset, item.value.clone())
+    }
+    pub fn take(&mut self) -> Option<CacheObject> {
+        match self.take_idx() {
+            Some(idx) => {
+                // TODO: decompress data and build cache object
+                // alloc reader
+                let (offset, value) = self.take_value(idx);
+                let mut cursor = Cursor::new(&self.file_buf[offset..]);
+                let mut tmp =0;
+                let (type_bits, expected_size) = utils::read_type_and_varint_size(&mut cursor,&mut tmp).unwrap();
+                let obj_type = ObjectType::from_pack_type_u8(type_bits).unwrap();
+                let mut is_delta= false;
+                let info =match value {
+                    NodeValue::Base(oid) => CacheObjectInfo::BaseObject(obj_type, oid),
+                    NodeValue::OffsetDelta(parent_idx) => {
+                        is_delta = true;
+                        let (_, final_size) =utils::read_offset_encoding(&mut cursor).unwrap();
+                        // can find parent by offset
+                        match obj_type {
+                            ObjectType::OffsetDelta => CacheObjectInfo::OffsetDelta(parent_idx,final_size),
+                            ObjectType::OffsetZstdelta => CacheObjectInfo::OffsetZstdelta(parent_idx,final_size),
+                            _ => CacheObjectInfo::OffsetDelta(parent_idx,final_size),
+                        }
+                    }
+                    NodeValue::RefDelta(base_hash) => {
+                        is_delta = true;
+                        let ref_sha = ObjectHash::from_stream(&mut cursor).unwrap();
+                        let (_, final_size) = utils::read_delta_object_size(&mut cursor).unwrap();
+                        CacheObjectInfo::HashDelta(ref_sha, final_size)
+                    }
+                };
+                let mut deflate = ZlibDecoder::new(&mut cursor);
+                let mut deflated_data: Vec<u8> = Vec::with_capacity(expected_size);
+                deflate.read_to_end(&mut deflated_data).unwrap();
+                let mut crc = crc32fast::Hasher::new();
+                crc.update(&self.file_buf[offset..cursor.position() as usize]);
+                Some(CacheObject{
+                    info: info,
+                    offset: offset,
+                    crc32: crc.finalize(),
+                    data_decompressed: deflated_data,
+                    mem_recorder: None,
+                    is_delta_in_pack: is_delta,
+                })
+            }
+            None => None,
+        }
+    }
+    /// return: true if ref cnt is 0
+    pub fn dec_ref(&mut self, idx: usize) -> bool {
+        let mut item = self.nodes[idx].lock().unwrap();
+        let child_len = item.child.as_ref().unwrap().len();
+        item.cur_child_idx += 1;
+        item.cur_child_idx as usize == child_len
+    }
+    pub fn graph_check(&self){
+        let sz  = self.nodes.len();
+        let mut delta_cnt =0;
+        for i in self.nodes.iter() {
+            let item = i.lock().unwrap();
+            match &item.child {
+                Some(child) => {
+                    delta_cnt += child.len();
+                }
+                None => {}
+            }
+        }
+        println!("delta cnt: {}", delta_cnt);
+        println!("node cnt: {}", sz);
+        assert!(sz == self.node_cnt);
+    }
+
+}

@@ -10,3 +10,6 @@ buck-out/
 src/.DS_Store
 .DS_Store
 examples/output_packs/buck-out
+work
+log.txt
+info.txt

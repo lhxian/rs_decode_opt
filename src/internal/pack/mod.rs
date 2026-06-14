@@ -12,6 +12,7 @@ pub mod pack_index;
 pub mod utils;
 pub mod waitlist;
 pub mod wrapper;
+pub mod graph;
 use std::sync::{Arc, atomic::AtomicUsize};
 
 use threadpool::ThreadPool;
@@ -37,6 +38,8 @@ pub struct Pack {
     pub mem_limit: Option<usize>,
     pub cache_objs_mem: Arc<AtomicUsize>,
     pub clean_tmp: bool,
+    pub total_size: usize,
+    pub max_size: usize,
 }
 
 #[cfg(test)]
