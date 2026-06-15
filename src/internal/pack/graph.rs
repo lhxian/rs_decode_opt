@@ -158,8 +158,8 @@ impl DependGraph {
         };
         pack.seek(SeekFrom::Start(0)).unwrap();
         pack.read_to_end(&mut graph.file_buf).unwrap();
-        println!("file buf len: {}", graph.file_buf.len());
-        println!("pack size: {}", end - cur);
+        // println!("file buf len: {}", graph.file_buf.len());
+        // println!("pack size: {}", end - cur);
         let mem_reader = Cursor::new(&mut graph.file_buf[12..]);
         let mut reader = LightWeightReader {
             inner: mem_reader,

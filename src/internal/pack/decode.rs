@@ -4,7 +4,8 @@
 use std::{
     // collections::HashMap, 
     io::{BufRead, Cursor, ErrorKind, Read, Seek}, path::PathBuf, sync::{
-        Arc, Mutex,
+        Arc, 
+        // Mutex,
         atomic::{AtomicUsize},
     }, thread::{self, JoinHandle}, 
     // time::Instant, 
@@ -259,9 +260,9 @@ impl Pack {
         // graph.graph_check();
         let shared_callback = Arc::new(callback);
         // test data
-        let arc_shared_count : Arc<Mutex<usize>>= Arc::new(Mutex::new(0));
-        let arc_no_cache_cnt : Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-        let arc_remove_cache_cnt : Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        // let arc_shared_count : Arc<Mutex<usize>>= Arc::new(Mutex::new(0));
+        // let arc_no_cache_cnt : Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        // let arc_remove_cache_cnt : Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
 
         for _ in 0..self.pool.max_count() {
             // make value
@@ -269,14 +270,17 @@ impl Pack {
             let task_callback =shared_callback.clone();
             let task_caches= self.caches.clone();
 
-            let task_count = arc_shared_count.clone();
-            let task_no_cache_cnt = arc_no_cache_cnt.clone();
-            let task_remove_cache_cnt = arc_remove_cache_cnt.clone();
+            // for test
+            // let task_count = arc_shared_count.clone();
+            // let task_no_cache_cnt = arc_no_cache_cnt.clone();
+            // let task_remove_cache_cnt = arc_remove_cache_cnt.clone();
             self.pool.execute(move || {
-                let mut cnt: usize =0;
+                // for test
+                // let mut cnt: usize =0;
+                // let mut no_cache_cnt: usize =0;
+                // let mut remove_cache_cnt: usize =0;
+
                 let mut direct_fall: usize =usize::MAX;
-                let mut no_cache_cnt: usize =0;
-                let mut remove_cache_cnt: usize =0;
                 loop{
                     let consume_index = if direct_fall != usize::MAX {
                         let res =Some(direct_fall);
@@ -287,7 +291,7 @@ impl Pack {
                     };
                     match consume_index {
                         Some(idx) => {
-                            cnt += 1;
+                            // cnt += 1;
                             let cache_obj = task_graph.take(idx);
                             let target_obj =match cache_obj.info {
                                 CacheObjectInfo::BaseObject(_,_ ) => cache_obj,
@@ -320,22 +324,19 @@ impl Pack {
                                     Some(child) => {
                                         // cache
                                         direct_fall = child;
-                                        // println!("add cache: {}", offset);
                                         task_caches.insert(offset,*oid,target_obj);
 
                                     }
                                     None => {
-                                        // println!("discard");
-                                        no_cache_cnt += 1;
+                                        // no_cache_cnt += 1;
                                     } // discard
                                 }
                             }
                             // check parent or eliminate
                             let (parent_idx ,parent_offset)= task_graph.get_parent_index_and_offset(idx) ;
                             if parent_idx != -1 && task_graph.dec_ref(parent_idx as usize){
-                                // println!("remove cache: {}, cur: {}",parent_offset, offset);
                                 task_caches.remove_by_offset(parent_offset);
-                                remove_cache_cnt +=1;
+                                // remove_cache_cnt +=1;
                             }
 
                         }
@@ -344,19 +345,20 @@ impl Pack {
                         }
                     }
                 }
-                let mut count = task_count.lock().unwrap();
-                *count += cnt;
-                let mut no_cache = task_no_cache_cnt.lock().unwrap();
-                *no_cache += no_cache_cnt;
-                let mut remove_cache = task_remove_cache_cnt.lock().unwrap();
-                *remove_cache += remove_cache_cnt;
+                // for test
+                // let mut count = task_count.lock().unwrap();
+                // *count += cnt;
+                // let mut no_cache = task_no_cache_cnt.lock().unwrap();
+                // *no_cache += no_cache_cnt;
+                // let mut remove_cache = task_remove_cache_cnt.lock().unwrap();
+                // *remove_cache += remove_cache_cnt;
             });
         }
         self.pool.join();
-        let work_cnt = arc_shared_count.lock().unwrap();
-        println!("task work cnt: {}",*work_cnt);
-        println!("no cache cnt: {}",*arc_no_cache_cnt.lock().unwrap());
-        println!("remove cache cnt: {}",*arc_remove_cache_cnt.lock().unwrap());
+        // let work_cnt = arc_shared_count.lock().unwrap();
+        // println!("task work cnt: {}",*work_cnt);
+        // println!("no cache cnt: {}",*arc_no_cache_cnt.lock().unwrap());
+        // println!("remove cache cnt: {}",*arc_remove_cache_cnt.lock().unwrap());
 
         Ok(())
     }
