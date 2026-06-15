@@ -40,8 +40,7 @@ pub trait _Cache {
     fn total_inserted(&self) -> usize;
     fn memory_used(&self) -> usize;
     fn clear(&self);
-    fn remove_by_offset(&mut self, offset: usize);
-    fn remove_by_hash(&mut self, hash: &ObjectHash);
+    fn remove_by_offset(&self, offset: usize);
 }
 
 impl lru_mem::HeapSize for ObjectHash {
@@ -265,14 +264,10 @@ impl _Cache for Caches {
         assert_eq!(self.pool.active_count(), 0);
         assert_eq!(self.lru_cache.lock().unwrap().len(), 0);
     }
-    fn remove_by_offset(&mut self, offset: usize) {
+    fn remove_by_offset(&self, offset: usize) {
         // TODO
         let object_hash = self.get_hash(offset).unwrap();
         self.lru_cache.lock().unwrap().remove(&object_hash);
-    }
-    fn remove_by_hash(&mut self, hash: &ObjectHash) {
-        // TODO
-        self.lru_cache.lock().unwrap().remove(hash);
     }
 }
 

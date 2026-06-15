@@ -30,12 +30,13 @@ use crate::{
 #[derive(Clone)]
 enum NodeValue {
     Base(ObjectHash), // oid
-    OffsetDelta(usize), // base index in nodes
+    OffsetDelta(usize), // base offset
     RefDelta(ObjectHash), // base hash
 }
 pub struct GraphNodeInfo {
     pub offset: usize,
-    pub cur_child_idx: i32,
+    pub ref_cnt: i32,
+    pub parent: i32,
     pub child: Option<Vec<usize>>, // child offset
     pub value: NodeValue,
 }
@@ -43,7 +44,8 @@ impl GraphNodeInfo {
     pub fn new(offset: usize, value: NodeValue) -> Self {
         Self{
             offset,
-            cur_child_idx: 0,
+            ref_cnt: 0,
+            parent: -1,
             child: None,
             value: value,
         }
@@ -56,7 +58,7 @@ pub struct DependGraph{
     pub ref_list: HashMap<ObjectHash, Vec<usize>>, // ref, offset
     pub file_buf: Vec<u8>,
     pub work_list: Mutex<Vec<usize>>,
-    cur_pos: usize,
+    cur_pos: Mutex<usize>,
 }
 struct LightWeightReader<R> {
     inner: R,
@@ -159,7 +161,7 @@ impl DependGraph {
             ref_list: HashMap::new(),
             file_buf : Vec::with_capacity((end - cur) as usize),
             work_list: Mutex::new(Vec::with_capacity(object_number/2 +1)),
-            cur_pos: 0,
+            cur_pos: Mutex::new(0),
         };
         pack.seek(SeekFrom::Start(0)).unwrap();
         pack.read_to_end(&mut graph.file_buf).unwrap();
@@ -199,6 +201,7 @@ impl DependGraph {
                     }).unwrap();
                     {
                         let mut parent = graph.nodes[parent_idx].lock().unwrap();
+                        parent.ref_cnt += 1;
                         match &mut parent.child {
                             Some(child) => {
                                 child.push(i);
@@ -208,7 +211,8 @@ impl DependGraph {
                             }
                         }
                     }
-                    let mut delta_item = GraphNodeInfo::new(init_offset, NodeValue::OffsetDelta(parent_idx));
+                    let mut delta_item = GraphNodeInfo::new(init_offset, NodeValue::OffsetDelta(base_offset));
+                    delta_item.parent = parent_idx as i32;
                     graph.nodes.push(Mutex::new(delta_item));
 
                 }
@@ -234,91 +238,156 @@ impl DependGraph {
         // check the mt deflate
         graph
     }
-    fn take_idx(&mut self) -> Option<usize> {
+    /// take the ready object index, if the work list is not empty, consume 1
+    /// else get the next base object in nodes
+    pub fn take_idx(&self) -> Option<usize> {
         let mut wl = self.work_list.lock().unwrap();
         if wl.len() > 0 {
             return Some(wl.pop().unwrap());
         }
         let obj_cnt = self.nodes.len();
         // get the next base object
-        while (self.cur_pos as usize) < obj_cnt {
-            let item = self.nodes[self.cur_pos as usize].lock().unwrap();
+        let mut pos = self.cur_pos.lock().unwrap();
+        while *pos < obj_cnt {
+            let item = self.nodes[*pos].lock().unwrap();
             match &item.value {
                 NodeValue::Base(_) => {
-                    let pos = self.cur_pos;
-                    self.cur_pos += 1;
-                    return Some(pos);
+                    let res = *pos;
+                    *pos += 1;
+                    return Some(res);
                 }
                 _ => {}
             }
-            self.cur_pos += 1;
+            *pos += 1;
         }
         None
     }
     // return (offset, value)
-    pub fn take_value(&mut self, idx:usize) -> (usize,NodeValue) {
+    fn take_value(&self, idx:usize) -> (usize,NodeValue) {
         let item = self.nodes[idx].lock().unwrap();
         (item.offset, item.value.clone())
     }
-    pub fn take(&mut self) -> Option<CacheObject> {
-        match self.take_idx() {
-            Some(idx) => {
-                // TODO: decompress data and build cache object
-                // alloc reader
-                let (offset, value) = self.take_value(idx);
-                let mut cursor = Cursor::new(&self.file_buf[offset..]);
-                let mut tmp =0;
-                let (type_bits, expected_size) = utils::read_type_and_varint_size(&mut cursor,&mut tmp).unwrap();
-                let obj_type = ObjectType::from_pack_type_u8(type_bits).unwrap();
-                let mut is_delta= false;
-                let info =match value {
-                    NodeValue::Base(oid) => CacheObjectInfo::BaseObject(obj_type, oid),
-                    NodeValue::OffsetDelta(parent_idx) => {
-                        is_delta = true;
-                        let (_, final_size) =utils::read_offset_encoding(&mut cursor).unwrap();
-                        // can find parent by offset
-                        match obj_type {
-                            ObjectType::OffsetDelta => CacheObjectInfo::OffsetDelta(parent_idx,final_size),
-                            ObjectType::OffsetZstdelta => CacheObjectInfo::OffsetZstdelta(parent_idx,final_size),
-                            _ => CacheObjectInfo::OffsetDelta(parent_idx,final_size),
-                        }
+    pub fn take(&self, idx: usize) ->CacheObject {
+        // TODO: decompress data and build cache object
+        // alloc reader
+        let (offset, value) = self.take_value(idx);
+        let mut cursor = Cursor::new(&self.file_buf[offset..]);
+        let mut tmp =0;
+        let (type_bits, expected_size) = utils::read_type_and_varint_size(&mut cursor,&mut tmp).unwrap();
+        let obj_type = ObjectType::from_pack_type_u8(type_bits).unwrap();
+        let mut is_delta= false;
+        let info =match value {
+            NodeValue::Base(oid) => CacheObjectInfo::BaseObject(obj_type, oid),
+            NodeValue::OffsetDelta(base_offset) => {
+                is_delta = true;
+                let (_, final_size) =utils::read_offset_encoding(&mut cursor).unwrap();
+                // can find parent by offset
+                match obj_type {
+                    ObjectType::OffsetDelta => CacheObjectInfo::OffsetDelta(base_offset,final_size),
+                    ObjectType::OffsetZstdelta => CacheObjectInfo::OffsetZstdelta(base_offset,final_size),
+                    _ => unreachable!(),
+                }
+            }
+            NodeValue::RefDelta(base_hash) => {
+                is_delta = true;
+                let ref_sha = ObjectHash::from_stream(&mut cursor).unwrap();
+                let (_, final_size) = utils::read_delta_object_size(&mut cursor).unwrap();
+                CacheObjectInfo::HashDelta(ref_sha, final_size)
+            }
+        };
+        let mut deflate = ZlibDecoder::new(&mut cursor);
+        let mut deflated_data: Vec<u8> = Vec::with_capacity(expected_size);
+        deflate.read_to_end(&mut deflated_data).unwrap();
+        let mut crc = crc32fast::Hasher::new();
+        let end_pos= offset + cursor.position() as usize;
+        crc.update(&self.file_buf[offset..end_pos]);
+        CacheObject{
+            info: info,
+            offset: offset,
+            crc32: crc.finalize(),
+            data_decompressed: deflated_data,
+            mem_recorder: None,
+            is_delta_in_pack: is_delta,
+        }
+    }
+    // no lock the work list, pass work list using parameter
+    // return first child and rest child cnt
+    pub fn take_child(&self, cur: usize, oid: &ObjectHash,work_list: &mut Vec<usize>) -> (Option<usize>, usize) {
+        let mut rest_cnt : usize= 0;
+        let mut item = self.nodes[cur].lock().unwrap();
+        let first_offset=match &item.child {
+            Some(child) => {
+                if child.len() > 0 {
+                    // add other child to work list
+                    rest_cnt += child.len() -1;
+                    let first = child[0];
+                    for i in &child[1..] {
+                        work_list.push(*i);
                     }
-                    NodeValue::RefDelta(base_hash) => {
-                        is_delta = true;
-                        let ref_sha = ObjectHash::from_stream(&mut cursor).unwrap();
-                        let (_, final_size) = utils::read_delta_object_size(&mut cursor).unwrap();
-                        CacheObjectInfo::HashDelta(ref_sha, final_size)
-                    }
-                };
-                let mut deflate = ZlibDecoder::new(&mut cursor);
-                let mut deflated_data: Vec<u8> = Vec::with_capacity(expected_size);
-                deflate.read_to_end(&mut deflated_data).unwrap();
-                let mut crc = crc32fast::Hasher::new();
-                crc.update(&self.file_buf[offset..cursor.position() as usize]);
-                Some(CacheObject{
-                    info: info,
-                    offset: offset,
-                    crc32: crc.finalize(),
-                    data_decompressed: deflated_data,
-                    mem_recorder: None,
-                    is_delta_in_pack: is_delta,
-                })
+                    Some(first)
+                }else {
+                    None
+                }
             }
             None => None,
+        };
+        // add ref delta
+        let first_child: Option<usize>= match self.ref_list.get(oid){
+            Some(childs) => {
+                // add ref cnt
+                item.ref_cnt += childs.len() as i32;
+                // set parent
+                for i in childs.iter() {
+                    let mut item = self.nodes[*i].lock().unwrap();
+                    item.parent = cur as i32;
+                }
+                // get the first if offset first is none
+                if first_offset.is_none() {
+                    rest_cnt += childs.len() -1;
+                    for i in &childs[1..] {
+                        work_list.push(*i);
+                    }
+                    Some(childs[0])
+                }else{
+                    rest_cnt += childs.len();
+                    for i in childs.iter(){
+                        work_list.push(*i);
+                    }
+                    first_offset
+                }
+            }
+            None => first_offset,
+        };
+        (first_child, rest_cnt)
+    }
+    pub fn get_parent_index_and_offset(&self, cur: usize) -> (i32,usize){
+        let item = self.nodes[cur].lock().unwrap();
+        let parent_idx =item.parent;
+        if parent_idx != -1{
+            let parent_item = self.nodes[parent_idx as usize].lock().unwrap();
+            (parent_idx, parent_item.offset)
+        }else {
+            (-1,0)
         }
     }
     /// return: true if ref cnt is 0
-    pub fn dec_ref(&mut self, idx: usize) -> bool {
+    pub fn dec_ref(&self, idx: usize) -> bool {
         let mut item = self.nodes[idx].lock().unwrap();
         let child_len = item.child.as_ref().unwrap().len();
-        item.cur_child_idx += 1;
-        item.cur_child_idx as usize == child_len
+        item.ref_cnt -= 1;
+        item.ref_cnt == 0
     }
     pub fn graph_check(&self){
         let sz  = self.nodes.len();
         let mut delta_cnt =0;
+        let mut with_parent_cnt :usize =0;
+        let mut ref_cnt: usize =0;
         for i in self.nodes.iter() {
             let item = i.lock().unwrap();
+            if item.parent != -1 {
+                with_parent_cnt += 1;
+            }
+            ref_cnt += item.ref_cnt as usize;
             match &item.child {
                 Some(child) => {
                     delta_cnt += child.len();
@@ -328,6 +397,8 @@ impl DependGraph {
         }
         println!("delta cnt: {}", delta_cnt);
         println!("node cnt: {}", sz);
+        println!("with parent cnt: {}", with_parent_cnt);
+        println!("ref cnt: {}", ref_cnt);
         assert!(sz == self.node_cnt);
     }
 

@@ -2,15 +2,10 @@
 //! and populates caches/metadata for downstream consumers.
 
 use std::{
-    io::{self, BufRead, Cursor, ErrorKind, Read, Seek, SeekFrom},
-    path::PathBuf,
-    sync::{
-        Arc,
+    collections::HashMap, io::{self, BufRead, Cursor, ErrorKind, Read, Seek, SeekFrom}, path::PathBuf, sync::{
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
-    },
-    thread::{self, JoinHandle},
-    time::Instant,
-    collections::HashMap,
+    }, thread::{self, JoinHandle}, time::Instant, usize
 };
 
 use axum::Error;
@@ -245,7 +240,7 @@ impl Pack {
     /// * A tuple with a `Vec<u8>` of the decompressed data and the total number of input bytes processed,
     /// * Or a `GitError` in case of a mismatch in expected size or any other reading error.
     ///
-    pub fn decompress_data(&mut self,
+    pub fn decompress_data(
         pack: &mut (impl BufRead + Send),
         expected_size: usize,
     ) -> Result<(Vec<u8>, usize), GitError> {
@@ -294,7 +289,7 @@ impl Pack {
     /// * A tuple of the next offset in the pack and the original compressed data as `Vec<u8>`,
     /// * Or a `GitError` in case of any reading or decompression error.
     ///
-    pub fn decode_pack_object(&mut self,
+    pub fn decode_pack_object(
         pack: &mut (impl BufRead + Send),
         offset: &mut usize,
     ) -> Result<Option<CacheObject>, GitError> {
@@ -322,7 +317,7 @@ impl Pack {
 
         match t {
             ObjectType::Commit | ObjectType::Tree | ObjectType::Blob | ObjectType::Tag => {
-                let (data, raw_size) = self.decompress_data(&mut reader, size)?;
+                let (data, raw_size) = Pack::decompress_data(&mut reader, size)?;
                 // println!("base {} {}",init_offset,raw_size);
                 *offset += raw_size;
                 let crc32 = hasher.finalize();
@@ -338,7 +333,7 @@ impl Pack {
                 let (delta_offset, bytes) = utils::read_offset_encoding(&mut reader).unwrap();
                 *offset += bytes;
 
-                let (data, raw_size) = self.decompress_data(&mut reader, size)?;
+                let (data, raw_size) =Pack::decompress_data(&mut reader, size)?;
                 *offset += raw_size;
 
                 // Count the base object offset: the current offset - delta offset
@@ -380,7 +375,7 @@ impl Pack {
                 *offset += get_hash_kind().size();
 
                 // let (data, raw_size) = Pack::decompress_data(&mut reader, size)?;
-                let (data, raw_size) =self.decompress_data(&mut reader, size)?;
+                let (data, raw_size) =Pack::decompress_data(&mut reader, size)?;
                 *offset += raw_size;
 
                 let mut reader = Cursor::new(&data);
@@ -406,7 +401,8 @@ impl Pack {
         }
     }
 
-    pub fn my_decode<F,C>(
+    // my_decode
+    pub fn decode<F,C>(
         &mut self,
         pack: &mut (impl BufRead + Send + Seek),
         callback: F,
@@ -426,9 +422,111 @@ impl Pack {
             }
         }
         let graph = Arc::new(DependGraph::build_graph(pack, self.number));
-        const LIST_CNT: usize = 256;
-        let mut work_list : Arc<[u8;LIST_CNT]>= Arc::new([0;LIST_CNT]);
         graph.graph_check();
+        let shared_callback = Arc::new(callback);
+        let arc_shared_count : Arc<Mutex<usize>>= Arc::new(Mutex::new(0));
+        let arc_no_cache_cnt : Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let arc_remove_cache_cnt : Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+
+        for _ in 0..self.pool.max_count() {
+            // make value
+            let task_graph = graph.clone();
+            let task_callback =shared_callback.clone();
+            let mut task_caches= self.caches.clone();
+
+            let mut task_count = arc_shared_count.clone();
+            let mut task_no_cache_cnt = arc_no_cache_cnt.clone();
+            let mut task_remove_cache_cnt = arc_remove_cache_cnt.clone();
+            self.pool.execute(move || {
+                let mut cnt: usize =0;
+                let mut direct_fall: usize =usize::MAX;
+                let mut no_cache_cnt: usize =0;
+                let mut remove_cache_cnt: usize =0;
+                loop{
+                    let consume_index = if direct_fall != usize::MAX {
+                        let res =Some(direct_fall);
+                        direct_fall = usize::MAX; // set
+                        res
+                    }else {
+                        task_graph.take_idx()
+                    };
+                    match consume_index {
+                        Some(idx) => {
+                            cnt += 1;
+                            let cache_obj = task_graph.take(idx);
+                            let target_obj =match cache_obj.info {
+                                CacheObjectInfo::BaseObject(_,_ ) => cache_obj,
+                                CacheObjectInfo::OffsetDelta(base_offset, _)  => {
+                                    let base_obj = task_caches.get_by_offset(base_offset).unwrap();
+                                    let new_obj = Pack::rebuild_delta(cache_obj,base_obj);
+                                    new_obj
+                                }
+                                CacheObjectInfo::OffsetZstdelta(base_offset,_ ) =>{
+                                    let base_obj = task_caches.get_by_offset(base_offset).unwrap();
+                                    let new_obj = Pack::rebuild_zstdelta(cache_obj,base_obj);
+                                    new_obj
+                                }
+                                CacheObjectInfo::HashDelta(base_ref, _) => {
+                                    let base_obj = task_caches.get_by_hash(base_ref).unwrap();
+                                    let new_obj = Pack::rebuild_delta(cache_obj,base_obj);
+                                    new_obj
+                                }
+                            };
+                            // apply callback to target object
+                            task_callback(target_obj.to_entry_metadata());
+                            // check ref delta
+                            let oid=  match &target_obj.info {
+                                CacheObjectInfo::BaseObject(_,oid) => oid,
+                                _ => unreachable!()
+                            };
+                            let offset= target_obj.offset;
+                            // lock the work list and decide whether to cache the object
+                            {
+                                let mut work_list = task_graph.work_list.lock().unwrap();
+                                let (first_child ,rest_cnt)= task_graph.take_child(idx, oid,&mut *work_list);
+                                match first_child {
+                                    Some(child) => {
+                                        // cache
+                                        direct_fall = child;
+                                        // println!("add cache: {}", offset);
+                                        task_caches.insert(offset,*oid,target_obj);
+
+                                    }
+                                    None => {
+                                        // println!("discard");
+                                        no_cache_cnt += 1;
+                                    } // discard
+                                }
+                            }
+                            // check parent or eliminate
+                            let (parent_idx ,parent_offset)= task_graph.get_parent_index_and_offset(idx) ;
+                            if parent_idx != -1 {
+                                if task_graph.dec_ref(parent_idx as usize) {
+                                    // println!("remove cache: {}, cur: {}",parent_offset, offset);
+                                    task_caches.remove_by_offset(parent_offset);
+                                    remove_cache_cnt +=1;
+                                }
+                            }
+
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                }
+                let mut count = task_count.lock().unwrap();
+                *count += cnt;
+                let mut no_cache = task_no_cache_cnt.lock().unwrap();
+                *no_cache += no_cache_cnt;
+                let mut remove_cache = task_remove_cache_cnt.lock().unwrap();
+                *remove_cache += remove_cache_cnt;
+            });
+        }
+        self.pool.join();
+        let work_cnt = arc_shared_count.lock().unwrap();
+        println!("task work cnt: {}",*work_cnt);
+        println!("no cache cnt: {}",*arc_no_cache_cnt.lock().unwrap());
+        println!("remove cache cnt: {}",*arc_remove_cache_cnt.lock().unwrap());
 
         Ok(())
     }
@@ -440,180 +538,168 @@ impl Pack {
     /// # Parameters
     /// * pack_id_callback: A callback that seed pack_file sha1 for updating database
     ///
-    pub fn decode<F, C>(
-        &mut self,
-        pack: &mut (impl BufRead + Send + Seek),
-        callback: F,
-        pack_id_callback: Option<C>,
-    ) -> Result<(), GitError>
-    where
-        F: Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send + 'static,
-        C: FnOnce(ObjectHash) + Send + 'static,
-    {
-        let time = Instant::now();
-        let mut last_update_time = time.elapsed().as_millis();
-        let log_info = |_i: usize, pack: &Pack| {
-            tracing::info!(
-                "time {:.2} s \t decode: {:?} \t dec-num: {} \t cah-num: {} \t Objs: {} MB \t CacheUsed: {} MB",
-                time.elapsed().as_millis() as f64 / 1000.0,
-                _i,
-                pack.pool.queued_count(),
-                pack.caches.queued_tasks(),
-                pack.cache_objs_mem_used() / 1024 / 1024,
-                pack.caches.memory_used() / 1024 / 1024
-            );
-        };
-        let result = Pack::check_header(pack);
-        match result {
-            Ok((object_num, _)) => {
-                self.number = object_num as usize;
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        }
-        let graph_start_time = time.elapsed().as_millis();
-        let graph = DependGraph::build_graph(pack, self.number);
-        let graph_end_time = time.elapsed().as_millis();
-        println!("graph build time: {}",graph_end_time - graph_start_time);
-        graph.graph_check();
-        pack.seek(SeekFrom::Start(12)).unwrap();
+    // pub fn decode_back<F, C>(
+    //     &mut self,
+    //     pack: &mut (impl BufRead + Send + Seek),
+    //     callback: F,
+    //     pack_id_callback: Option<C>,
+    // ) -> Result<(), GitError>
+    // where
+    //     F: Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send + 'static,
+    //     C: FnOnce(ObjectHash) + Send + 'static,
+    // {
+    //     let time = Instant::now();
+    //     let mut last_update_time = time.elapsed().as_millis();
+    //     let log_info = |_i: usize, pack: &Pack| {
+    //         tracing::info!(
+    //             "time {:.2} s \t decode: {:?} \t dec-num: {} \t cah-num: {} \t Objs: {} MB \t CacheUsed: {} MB",
+    //             time.elapsed().as_millis() as f64 / 1000.0,
+    //             _i,
+    //             pack.pool.queued_count(),
+    //             pack.caches.queued_tasks(),
+    //             pack.cache_objs_mem_used() / 1024 / 1024,
+    //             pack.caches.memory_used() / 1024 / 1024
+    //         );
+    //     };
+    //     let callback = Arc::new(callback);
 
-        let callback = Arc::new(callback);
+    //     let caches = self.caches.clone();
+    //     let mut reader = Wrapper::new(io::BufReader::new(pack));
 
-        let caches = self.caches.clone();
-        let mut reader = Wrapper::new(io::BufReader::new(pack));
-        // let mut reader = Wrapper::new(pack);
+    //     let result = Pack::check_header(&mut reader);
+    //     match result {
+    //         Ok((object_num, _)) => {
+    //             self.number = object_num as usize;
+    //         }
+    //         Err(e) => {
+    //             return Err(e);
+    //         }
+    //     }
+    //     tracing::info!("The pack file has {} objects", self.number);
+    //     let mut offset: usize = 12;
+    //     let mut i = 0;
+    //     while i < self.number {
+    //         // log per 1000 objects and 1 second
+    //         if i % 1000 == 0 {
+    //             let time_now = time.elapsed().as_millis();
+    //             if time_now - last_update_time > 1000 {
+    //                 log_info(i, self);
+    //                 last_update_time = time_now;
+    //             }
+    //         }
+    //         // 3 parts: Waitlist + TheadPool + Caches
+    //         // hardcode the limit of the tasks of threads_pool queue, to limit memory
+    //         while self.pool.queued_count() > 2000
+    //             || self
+    //                 .mem_limit
+    //                 .map(|limit| self.memory_used() > limit)
+    //                 .unwrap_or(false)
+    //         {
+    //             thread::yield_now();
+    //         }
+    //         let r: Result<Option<CacheObject>, GitError> =
+    //             Pack::decode_pack_object(&mut reader, &mut offset);
+    //         match r {
+    //             Ok(Some(mut obj)) => {
+    //                 obj.set_mem_recorder(self.cache_objs_mem.clone());
+    //                 obj.record_mem_size();
 
-        tracing::info!("The pack file has {} objects", self.number);
-        let mut offset: usize = 12;
-        let mut i = 0;
+    //                 // Wrapper of Arc Params, for convenience to pass
+    //                 let params = Arc::new(SharedParams {
+    //                     pool: self.pool.clone(),
+    //                     waitlist: self.waitlist.clone(),
+    //                     caches: self.caches.clone(),
+    //                     cache_objs_mem_size: self.cache_objs_mem.clone(),
+    //                     callback: callback.clone(),
+    //                 });
 
-        while i < self.number {
-            // log per 1000 objects and 1 second
-            if i % 1000 == 0 {
-                let time_now = time.elapsed().as_millis();
-                if time_now - last_update_time > 1000 {
-                    log_info(i, self);
-                    last_update_time = time_now;
-                }
-            }
-            // 3 parts: Waitlist + TheadPool + Caches
-            // hardcode the limit of the tasks of threads_pool queue, to limit memory
-            while self.pool.queued_count() > 2000
-                || self
-                    .mem_limit
-                    .map(|limit| self.memory_used() > limit)
-                    .unwrap_or(false)
-            {
-                thread::yield_now();
-            }
-            let r: Result<Option<CacheObject>, GitError> =
-                // Pack::decode_pack_object(&mut reader, &mut offset);
-                self.decode_pack_object(&mut reader, &mut offset);
-            match r {
-                Ok(Some(mut obj)) => {
-                    obj.set_mem_recorder(self.cache_objs_mem.clone());
-                    obj.record_mem_size();
+    //                 let caches = caches.clone();
+    //                 let waitlist = self.waitlist.clone();
+    //                 let kind = get_hash_kind();
+    //                 self.pool.execute(move || {
+    //                     set_hash_kind(kind);
+    //                     match obj.info {
+    //                         CacheObjectInfo::BaseObject(_, _) => {
+    //                             Self::cache_obj_and_process_waitlist(params, obj);
+    //                         }
+    //                         CacheObjectInfo::OffsetDelta(base_offset, _)
+    //                         | CacheObjectInfo::OffsetZstdelta(base_offset, _) => {
+    //                             if let Some(base_obj) = caches.get_by_offset(base_offset) {
+    //                                 Self::process_delta(params, obj, base_obj);
+    //                             } else {
+    //                                 // You can delete this 'if' block ↑, because there are Second check in 'else'
+    //                                 // It will be more readable, but the performance will be slightly reduced
+    //                                 waitlist.insert_offset(base_offset, obj);
+    //                                 // Second check: prevent that the base_obj thread has finished before the waitlist insert
+    //                                 if let Some(base_obj) = caches.get_by_offset(base_offset) {
+    //                                     Self::process_waitlist(params, base_obj);
+    //                                 }
+    //                             }
+    //                         }
+    //                         CacheObjectInfo::HashDelta(base_ref, _) => {
+    //                             if let Some(base_obj) = caches.get_by_hash(base_ref) {
+    //                                 Self::process_delta(params, obj, base_obj);
+    //                             } else {
+    //                                 waitlist.insert_ref(base_ref, obj);
+    //                                 if let Some(base_obj) = caches.get_by_hash(base_ref) {
+    //                                     Self::process_waitlist(params, base_obj);
+    //                                 }
+    //                             }
+    //                         }
+    //                     }
+    //                 });
+    //             }
+    //             Ok(None) => {}
+    //             Err(e) => {
+    //                 return Err(e);
+    //             }
+    //         }
+    //         i += 1;
+    //     }
+    //     log_info(i, self);
+    //     let render_hash = reader.final_hash();
+    //     self.signature = ObjectHash::from_stream(&mut reader).unwrap();
 
-                    // Wrapper of Arc Params, for convenience to pass
-                    let params = Arc::new(SharedParams {
-                        pool: self.pool.clone(),
-                        waitlist: self.waitlist.clone(),
-                        caches: self.caches.clone(),
-                        cache_objs_mem_size: self.cache_objs_mem.clone(),
-                        callback: callback.clone(),
-                    });
+    //     if render_hash != self.signature {
+    //         return Err(GitError::InvalidPackFile(format!(
+    //             "The pack file hash {} does not match the trailer hash {}",
+    //             render_hash, self.signature
+    //         )));
+    //     }
 
-                    let caches = caches.clone();
-                    let waitlist = self.waitlist.clone();
-                    let kind = get_hash_kind();
-                    self.pool.execute(move || {
-                        set_hash_kind(kind);
-                        match obj.info {
-                            CacheObjectInfo::BaseObject(_, _) => {
-                                Self::cache_obj_and_process_waitlist(params, obj);
-                            }
-                            CacheObjectInfo::OffsetDelta(base_offset, _)
-                            | CacheObjectInfo::OffsetZstdelta(base_offset, _) => {
-                                if let Some(base_obj) = caches.get_by_offset(base_offset) {
-                                    Self::process_delta(params, obj, base_obj);
-                                } else {
-                                    // You can delete this 'if' block ↑, because there are Second check in 'else'
-                                    // It will be more readable, but the performance will be slightly reduced
-                                    waitlist.insert_offset(base_offset, obj);
-                                    // Second check: prevent that the base_obj thread has finished before the waitlist insert
-                                    if let Some(base_obj) = caches.get_by_offset(base_offset) {
-                                        Self::process_waitlist(params, base_obj);
-                                    }
-                                }
-                            }
-                            CacheObjectInfo::HashDelta(base_ref, _) => {
-                                if let Some(base_obj) = caches.get_by_hash(base_ref) {
-                                    Self::process_delta(params, obj, base_obj);
-                                } else {
-                                    waitlist.insert_ref(base_ref, obj);
-                                    if let Some(base_obj) = caches.get_by_hash(base_ref) {
-                                        Self::process_waitlist(params, base_obj);
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-            i += 1;
-        }
-        log_info(i, self);
-        let render_hash = reader.final_hash();
-        self.signature = ObjectHash::from_stream(&mut reader).unwrap();
+    //     let end = utils::is_eof(&mut reader);
+    //     if !end {
+    //         return Err(GitError::InvalidPackFile(
+    //             "The pack file is not at the end".to_string(),
+    //         ));
+    //     }
 
-        if render_hash != self.signature {
-            return Err(GitError::InvalidPackFile(format!(
-                "The pack file hash {} does not match the trailer hash {}",
-                render_hash, self.signature
-            )));
-        }
+    //     self.pool.join(); // wait for all threads to finish
 
-        let end = utils::is_eof(&mut reader);
-        if !end {
-            return Err(GitError::InvalidPackFile(
-                "The pack file is not at the end".to_string(),
-            ));
-        }
+    //     // send pack id for metadata
+    //     if let Some(pack_callback) = pack_id_callback {
+    //         pack_callback(self.signature);
+    //     }
+    //     // !Attention: Caches threadpool may not stop, but it's not a problem (garbage file data)
+    //     // So that files != self.number
+    //     assert_eq!(self.waitlist.map_offset.len(), 0);
+    //     assert_eq!(self.waitlist.map_ref.len(), 0);
+    //     // Because we may skip some objects (e.g. AI objects), we use >= instead of ==
+    //     assert!(self.number >= caches.total_inserted());
+    //     tracing::info!(
+    //         "The pack file has been decoded successfully, takes: [ {:?} ]",
+    //         time.elapsed()
+    //     );
+    //     self.caches.clear(); // clear cached objects & stop threads
+    //     assert_eq!(self.cache_objs_mem_used(), 0); // all the objs should be dropped until here
 
-        self.pool.join(); // wait for all threads to finish
+    //     // impl in Drop Trait
+    //     // if self.clean_tmp {
+    //     //     self.caches.remove_tmp_dir();
+    //     // }
 
-        // send pack id for metadata
-        if let Some(pack_callback) = pack_id_callback {
-            pack_callback(self.signature);
-        }
-        // !Attention: Caches threadpool may not stop, but it's not a problem (garbage file data)
-        // So that files != self.number
-        assert_eq!(self.waitlist.map_offset.len(), 0);
-        assert_eq!(self.waitlist.map_ref.len(), 0);
-        // Because we may skip some objects (e.g. AI objects), we use >= instead of ==
-        assert!(self.number >= caches.total_inserted());
-        tracing::info!(
-            "The pack file has been decoded successfully, takes: [ {:?} ]",
-            time.elapsed()
-        );
-        self.caches.clear(); // clear cached objects & stop threads
-        assert_eq!(self.cache_objs_mem_used(), 0); // all the objs should be dropped until here
-
-        // impl in Drop Trait
-        // if self.clean_tmp {
-        //     self.caches.remove_tmp_dir();
-        // }
-        dbg!("[INFO] total size: {}",self.total_size);
-        dbg!("[INFO] max size: {}",self.max_size);
-
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     /// Decode a Pack in a new thread and send the CacheObjects while decoding.
     /// <br> Attention: It will consume the `pack` and return in a JoinHandle.
