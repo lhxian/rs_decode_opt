@@ -2,16 +2,20 @@
 //! and populates caches/metadata for downstream consumers.
 
 use std::{
-    collections::HashMap, io::{self, BufRead, Cursor, ErrorKind, Read, Seek, SeekFrom}, path::PathBuf, sync::{
+    // collections::HashMap, 
+    io::{BufRead, Cursor, ErrorKind, Read, Seek}, path::PathBuf, sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    }, thread::{self, JoinHandle}, time::Instant, usize
+        atomic::{AtomicUsize},
+    }, thread::{self, JoinHandle}, 
+    // time::Instant, 
+    // usize
 };
 
-use axum::Error;
-use bytes::Bytes;
-use flate2::bufread::ZlibDecoder;
-use futures_util::{Stream, StreamExt};
+// use axum::Error;
+// use bytes::Bytes;
+// use flate2::bufread::ZlibDecoder;
+// use futures_util::{Stream, StreamExt};
+// use futures_util::StreamExt;
 use threadpool::ThreadPool;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
@@ -21,58 +25,57 @@ use crate::{
     hash::{ObjectHash, get_hash_kind, set_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
-        object::types::ObjectType,
+        // object::types::ObjectType,
         pack::{
             DEFAULT_TMP_DIR, Pack,
             cache::{_Cache, Caches},
-            cache_object::{CacheObject, CacheObjectInfo, MemSizeRecorder},
-            channel_reader::StreamBufReader,
+            cache_object::{CacheObject, CacheObjectInfo},
             entry::Entry,
             utils,
             waitlist::Waitlist,
-            wrapper::Wrapper,
+            // wrapper::Wrapper,
             graph::DependGraph,
         },
     },
-    utils::CountingReader,
+    // utils::CountingReader,
     zstdelta,
 };
 
-/// A reader that counts bytes read and computes CRC32 checksum.
-/// which is used to verify the integrity of decompressed data.
-pub struct CrcCountingReader<'a, R> {
-    inner: R,
-    bytes_read: u64,
-    crc: &'a mut crc32fast::Hasher,
-}
-impl<R: Read> Read for CrcCountingReader<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.bytes_read += n as u64;
-        self.crc.update(&buf[..n]);
-        Ok(n)
-    }
-}
-impl<R: BufRead> BufRead for CrcCountingReader<'_, R> {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        self.inner.fill_buf()
-    }
-    fn consume(&mut self, amt: usize) {
-        let buf = self.inner.fill_buf().unwrap_or(&[]);
-        self.crc.update(&buf[..amt.min(buf.len())]);
-        self.bytes_read += amt as u64;
-        self.inner.consume(amt);
-    }
-}
+// A reader that counts bytes read and computes CRC32 checksum.
+// which is used to verify the integrity of decompressed data.
+// pub struct CrcCountingReader<'a, R> {
+//     inner: R,
+//     bytes_read: u64,
+//     crc: &'a mut crc32fast::Hasher,
+// }
+// impl<R: Read> Read for CrcCountingReader<'_, R> {
+//     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+//         let n = self.inner.read(buf)?;
+//         self.bytes_read += n as u64;
+//         self.crc.update(&buf[..n]);
+//         Ok(n)
+//     }
+// }
+// impl<R: BufRead> BufRead for CrcCountingReader<'_, R> {
+//     fn fill_buf(&mut self) -> io::Result<&[u8]> {
+//         self.inner.fill_buf()
+//     }
+//     fn consume(&mut self, amt: usize) {
+//         let buf = self.inner.fill_buf().unwrap_or(&[]);
+//         self.crc.update(&buf[..amt.min(buf.len())]);
+//         self.bytes_read += amt as u64;
+//         self.inner.consume(amt);
+//     }
+// }
 
-/// For the convenience of passing parameters
-struct SharedParams {
-    pub pool: Arc<ThreadPool>,
-    pub waitlist: Arc<Waitlist>,
-    pub caches: Arc<Caches>,
-    pub cache_objs_mem_size: Arc<AtomicUsize>,
-    pub callback: Arc<dyn Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send>,
-}
+// For the convenience of passing parameters
+// struct SharedParams {
+//     pub pool: Arc<ThreadPool>,
+//     pub waitlist: Arc<Waitlist>,
+//     pub caches: Arc<Caches>,
+//     pub cache_objs_mem_size: Arc<AtomicUsize>,
+//     pub callback: Arc<dyn Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send>,
+// }
 
 
 impl Drop for Pack {
@@ -229,184 +232,15 @@ impl Pack {
         }
     }
 
-    /// Decompresses data from a given Read and BufRead source using Zlib decompression.
-    ///
-    /// # Parameters
-    /// * `pack`: A source that implements both Read and BufRead traits (e.g., file, network stream).
-    /// * `expected_size`: The expected decompressed size of the data.
-    ///
-    /// # Returns
-    /// Returns a `Result` containing either:
-    /// * A tuple with a `Vec<u8>` of the decompressed data and the total number of input bytes processed,
-    /// * Or a `GitError` in case of a mismatch in expected size or any other reading error.
-    ///
-    pub fn decompress_data(
-        pack: &mut (impl BufRead + Send),
-        expected_size: usize,
-    ) -> Result<(Vec<u8>, usize), GitError> {
-        // Create a buffer with the expected size for the decompressed data
-        
-        let mut buf =Vec::with_capacity(expected_size) ;
-
-        let mut counting_reader = CountingReader::new(pack);
-        // Create a new Zlib decoder with the original data
-        //let mut deflate = ZlibDecoder::new(pack);
-        let mut deflate = ZlibDecoder::new(&mut counting_reader);
-        // Attempt to read data to the end of the buffer
-        match deflate.read_to_end(&mut buf) {
-            Ok(_) => {
-                // Check if the length of the buffer matches the expected size
-                if buf.len() != expected_size {
-                    Err(GitError::InvalidPackFile(format!(
-                        "The object size {} does not match the expected size {}",
-                        buf.len(),
-                        expected_size
-                    )))
-                } else {
-                    // If everything is as expected, return the buffer, the original data, and the total number of input bytes processed
-                    let actual_input_bytes = counting_reader.bytes_read as usize;
-                    Ok((buf, actual_input_bytes))
-                }
-            }
-            Err(e) => {
-                // If there is an error in reading, return a GitError
-                Err(GitError::InvalidPackFile(format!(
-                    "Decompression error: {e}"
-                )))
-            }
-        }
-    }
 
     
-    /// Decodes a pack object from a given Read and BufRead source and returns the object as a [`CacheObject`].
-    ///
-    /// # Parameters
-    /// * `pack`: A source that implements both Read and BufRead traits.
-    /// * `offset`: A mutable reference to the current offset within the pack.
-    ///
-    /// # Returns
-    /// Returns a `Result` containing either:
-    /// * A tuple of the next offset in the pack and the original compressed data as `Vec<u8>`,
-    /// * Or a `GitError` in case of any reading or decompression error.
-    ///
-    pub fn decode_pack_object(
-        pack: &mut (impl BufRead + Send),
-        offset: &mut usize,
-    ) -> Result<Option<CacheObject>, GitError> {
-        let init_offset = *offset;
-        let mut hasher = crc32fast::Hasher::new();
-        let mut reader = CrcCountingReader {
-            inner: pack,
-            bytes_read: 0,
-            crc: &mut hasher,
-        };
-
-        // Attempt to read the type and size, handle potential errors
-        // Note: read_type_and_varint_size updates the offset manually, but we can rely on reader.bytes_read
-        let (type_bits, size) = match utils::read_type_and_varint_size(&mut reader, offset) {
-            Ok(result) => result,
-            Err(e) => {
-                // Handle the error e.g., by logging it or converting it to GitError
-                // and then return from the function
-                return Err(GitError::InvalidPackFile(format!("Read error: {e}")));
-            }
-        };
-
-        // Check if the object type is valid
-        let t = ObjectType::from_pack_type_u8(type_bits)?;
-
-        match t {
-            ObjectType::Commit | ObjectType::Tree | ObjectType::Blob | ObjectType::Tag => {
-                let (data, raw_size) = Pack::decompress_data(&mut reader, size)?;
-                // println!("base {} {}",init_offset,raw_size);
-                *offset += raw_size;
-                let crc32 = hasher.finalize();
-                Ok(Some(CacheObject::new_for_undeltified(
-                    t,
-                    data,
-                    init_offset,
-                    crc32,
-                )))
-            }
-            ObjectType::OffsetDelta | ObjectType::OffsetZstdelta => {
-                let cur_offset = *offset;
-                let (delta_offset, bytes) = utils::read_offset_encoding(&mut reader).unwrap();
-                *offset += bytes;
-
-                let (data, raw_size) =Pack::decompress_data(&mut reader, size)?;
-                *offset += raw_size;
-
-                // Count the base object offset: the current offset - delta offset
-                let base_offset = init_offset
-                    .checked_sub(delta_offset as usize)
-                    .ok_or_else(|| {
-                        GitError::InvalidObjectInfo("Invalid OffsetDelta offset".to_string())
-                    })
-                    .unwrap();
-                // println!("delta_offset {} {}",init_offset,base_offset);
-
-                let mut reader = Cursor::new(&data);
-                let (_, final_size) = utils::read_delta_object_size(&mut reader)?;
-
-                let obj_info = match t {
-                    ObjectType::OffsetDelta => {
-                        CacheObjectInfo::OffsetDelta(base_offset, final_size)
-                    }
-                    ObjectType::OffsetZstdelta => {
-                        CacheObjectInfo::OffsetZstdelta(base_offset, final_size)
-                    }
-                    _ => unreachable!(),
-                };
-                let crc32 = hasher.finalize();
-                Ok(Some(CacheObject {
-                    info: obj_info,
-                    offset: init_offset,
-                    crc32,
-                    data_decompressed: data,
-                    mem_recorder: None,
-                    is_delta_in_pack: true,
-                }))
-            }
-            ObjectType::HashDelta => {
-                // Read hash bytes to get the reference object hash(size depends on hash kind,e.g.,20 for SHA1,32 for SHA256)
-                let ref_sha = ObjectHash::from_stream(&mut reader).unwrap();
-                // Offset is incremented by 20/32 bytes
-                // println!("delta_hash {} {:?}",init_offset,ref_sha);
-                *offset += get_hash_kind().size();
-
-                // let (data, raw_size) = Pack::decompress_data(&mut reader, size)?;
-                let (data, raw_size) =Pack::decompress_data(&mut reader, size)?;
-                *offset += raw_size;
-
-                let mut reader = Cursor::new(&data);
-                let (_, final_size) = utils::read_delta_object_size(&mut reader)?;
-
-                let crc32 = hasher.finalize();
-
-                Ok(Some(CacheObject {
-                    info: CacheObjectInfo::HashDelta(ref_sha, final_size),
-                    offset: init_offset,
-                    crc32,
-                    data_decompressed: data,
-                    mem_recorder: None,
-                    is_delta_in_pack: true,
-                }))
-            }
-            // AI object types (ContextSnapshot, Decision, etc.) use u8 IDs >= 8
-            // and cannot appear in a pack file (3-bit type field only holds 1-7).
-            // `from_pack_type_u8` already rejects them, but guard explicitly here.
-            other => Err(GitError::InvalidPackFile(format!(
-                "AI object type `{other}` cannot appear in a pack file"
-            ))),
-        }
-    }
-
     // my_decode
+    /// Decodes a `Pack` from a `Stream` of `Bytes`, and sends the `Entry` while decoding.
     pub fn decode<F,C>(
         &mut self,
         pack: &mut (impl BufRead + Send + Seek),
         callback: F,
-        pack_id_callback: Option<C>,
+        _pack_id_callback: Option<C>,
     ) -> Result<(), GitError>
     where
         F: Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send + 'static,
@@ -422,8 +256,9 @@ impl Pack {
             }
         }
         let graph = Arc::new(DependGraph::build_graph(pack, self.number));
-        graph.graph_check();
+        // graph.graph_check();
         let shared_callback = Arc::new(callback);
+        // test data
         let arc_shared_count : Arc<Mutex<usize>>= Arc::new(Mutex::new(0));
         let arc_no_cache_cnt : Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
         let arc_remove_cache_cnt : Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
@@ -432,11 +267,11 @@ impl Pack {
             // make value
             let task_graph = graph.clone();
             let task_callback =shared_callback.clone();
-            let mut task_caches= self.caches.clone();
+            let task_caches= self.caches.clone();
 
-            let mut task_count = arc_shared_count.clone();
-            let mut task_no_cache_cnt = arc_no_cache_cnt.clone();
-            let mut task_remove_cache_cnt = arc_remove_cache_cnt.clone();
+            let task_count = arc_shared_count.clone();
+            let task_no_cache_cnt = arc_no_cache_cnt.clone();
+            let task_remove_cache_cnt = arc_remove_cache_cnt.clone();
             self.pool.execute(move || {
                 let mut cnt: usize =0;
                 let mut direct_fall: usize =usize::MAX;
@@ -458,18 +293,15 @@ impl Pack {
                                 CacheObjectInfo::BaseObject(_,_ ) => cache_obj,
                                 CacheObjectInfo::OffsetDelta(base_offset, _)  => {
                                     let base_obj = task_caches.get_by_offset(base_offset).unwrap();
-                                    let new_obj = Pack::rebuild_delta(cache_obj,base_obj);
-                                    new_obj
+                                     Pack::rebuild_delta(cache_obj,base_obj)
                                 }
                                 CacheObjectInfo::OffsetZstdelta(base_offset,_ ) =>{
                                     let base_obj = task_caches.get_by_offset(base_offset).unwrap();
-                                    let new_obj = Pack::rebuild_zstdelta(cache_obj,base_obj);
-                                    new_obj
+                                    Pack::rebuild_zstdelta(cache_obj,base_obj)
                                 }
                                 CacheObjectInfo::HashDelta(base_ref, _) => {
                                     let base_obj = task_caches.get_by_hash(base_ref).unwrap();
-                                    let new_obj = Pack::rebuild_delta(cache_obj,base_obj);
-                                    new_obj
+                                    Pack::rebuild_delta(cache_obj,base_obj)
                                 }
                             };
                             // apply callback to target object
@@ -483,7 +315,7 @@ impl Pack {
                             // lock the work list and decide whether to cache the object
                             {
                                 let mut work_list = task_graph.work_list.lock().unwrap();
-                                let (first_child ,rest_cnt)= task_graph.take_child(idx, oid,&mut *work_list);
+                                let (first_child ,_)= task_graph.take_child(idx, oid,&mut work_list);
                                 match first_child {
                                     Some(child) => {
                                         // cache
@@ -500,12 +332,10 @@ impl Pack {
                             }
                             // check parent or eliminate
                             let (parent_idx ,parent_offset)= task_graph.get_parent_index_and_offset(idx) ;
-                            if parent_idx != -1 {
-                                if task_graph.dec_ref(parent_idx as usize) {
-                                    // println!("remove cache: {}, cur: {}",parent_offset, offset);
-                                    task_caches.remove_by_offset(parent_offset);
-                                    remove_cache_cnt +=1;
-                                }
+                            if parent_idx != -1 && task_graph.dec_ref(parent_idx as usize){
+                                // println!("remove cache: {}, cur: {}",parent_offset, offset);
+                                task_caches.remove_by_offset(parent_offset);
+                                remove_cache_cnt +=1;
                             }
 
                         }
@@ -532,234 +362,19 @@ impl Pack {
     }
 
 
-    /// Decodes a pack file from a given Read and BufRead source, for each object in the pack,
-    /// it decodes the object and processes it using the provided callback function.
-    ///
-    /// # Parameters
-    /// * pack_id_callback: A callback that seed pack_file sha1 for updating database
-    ///
-    // pub fn decode_back<F, C>(
-    //     &mut self,
-    //     pack: &mut (impl BufRead + Send + Seek),
-    //     callback: F,
-    //     pack_id_callback: Option<C>,
-    // ) -> Result<(), GitError>
-    // where
-    //     F: Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send + 'static,
-    //     C: FnOnce(ObjectHash) + Send + 'static,
-    // {
-    //     let time = Instant::now();
-    //     let mut last_update_time = time.elapsed().as_millis();
-    //     let log_info = |_i: usize, pack: &Pack| {
-    //         tracing::info!(
-    //             "time {:.2} s \t decode: {:?} \t dec-num: {} \t cah-num: {} \t Objs: {} MB \t CacheUsed: {} MB",
-    //             time.elapsed().as_millis() as f64 / 1000.0,
-    //             _i,
-    //             pack.pool.queued_count(),
-    //             pack.caches.queued_tasks(),
-    //             pack.cache_objs_mem_used() / 1024 / 1024,
-    //             pack.caches.memory_used() / 1024 / 1024
-    //         );
-    //     };
-    //     let callback = Arc::new(callback);
 
-    //     let caches = self.caches.clone();
-    //     let mut reader = Wrapper::new(io::BufReader::new(pack));
 
-    //     let result = Pack::check_header(&mut reader);
-    //     match result {
-    //         Ok((object_num, _)) => {
-    //             self.number = object_num as usize;
-    //         }
-    //         Err(e) => {
-    //             return Err(e);
-    //         }
-    //     }
-    //     tracing::info!("The pack file has {} objects", self.number);
-    //     let mut offset: usize = 12;
-    //     let mut i = 0;
-    //     while i < self.number {
-    //         // log per 1000 objects and 1 second
-    //         if i % 1000 == 0 {
-    //             let time_now = time.elapsed().as_millis();
-    //             if time_now - last_update_time > 1000 {
-    //                 log_info(i, self);
-    //                 last_update_time = time_now;
-    //             }
-    //         }
-    //         // 3 parts: Waitlist + TheadPool + Caches
-    //         // hardcode the limit of the tasks of threads_pool queue, to limit memory
-    //         while self.pool.queued_count() > 2000
-    //             || self
-    //                 .mem_limit
-    //                 .map(|limit| self.memory_used() > limit)
-    //                 .unwrap_or(false)
-    //         {
-    //             thread::yield_now();
-    //         }
-    //         let r: Result<Option<CacheObject>, GitError> =
-    //             Pack::decode_pack_object(&mut reader, &mut offset);
-    //         match r {
-    //             Ok(Some(mut obj)) => {
-    //                 obj.set_mem_recorder(self.cache_objs_mem.clone());
-    //                 obj.record_mem_size();
-
-    //                 // Wrapper of Arc Params, for convenience to pass
-    //                 let params = Arc::new(SharedParams {
-    //                     pool: self.pool.clone(),
-    //                     waitlist: self.waitlist.clone(),
-    //                     caches: self.caches.clone(),
-    //                     cache_objs_mem_size: self.cache_objs_mem.clone(),
-    //                     callback: callback.clone(),
-    //                 });
-
-    //                 let caches = caches.clone();
-    //                 let waitlist = self.waitlist.clone();
-    //                 let kind = get_hash_kind();
-    //                 self.pool.execute(move || {
-    //                     set_hash_kind(kind);
-    //                     match obj.info {
-    //                         CacheObjectInfo::BaseObject(_, _) => {
-    //                             Self::cache_obj_and_process_waitlist(params, obj);
-    //                         }
-    //                         CacheObjectInfo::OffsetDelta(base_offset, _)
-    //                         | CacheObjectInfo::OffsetZstdelta(base_offset, _) => {
-    //                             if let Some(base_obj) = caches.get_by_offset(base_offset) {
-    //                                 Self::process_delta(params, obj, base_obj);
-    //                             } else {
-    //                                 // You can delete this 'if' block ↑, because there are Second check in 'else'
-    //                                 // It will be more readable, but the performance will be slightly reduced
-    //                                 waitlist.insert_offset(base_offset, obj);
-    //                                 // Second check: prevent that the base_obj thread has finished before the waitlist insert
-    //                                 if let Some(base_obj) = caches.get_by_offset(base_offset) {
-    //                                     Self::process_waitlist(params, base_obj);
-    //                                 }
-    //                             }
-    //                         }
-    //                         CacheObjectInfo::HashDelta(base_ref, _) => {
-    //                             if let Some(base_obj) = caches.get_by_hash(base_ref) {
-    //                                 Self::process_delta(params, obj, base_obj);
-    //                             } else {
-    //                                 waitlist.insert_ref(base_ref, obj);
-    //                                 if let Some(base_obj) = caches.get_by_hash(base_ref) {
-    //                                     Self::process_waitlist(params, base_obj);
-    //                                 }
-    //                             }
-    //                         }
-    //                     }
-    //                 });
-    //             }
-    //             Ok(None) => {}
-    //             Err(e) => {
-    //                 return Err(e);
-    //             }
-    //         }
-    //         i += 1;
-    //     }
-    //     log_info(i, self);
-    //     let render_hash = reader.final_hash();
-    //     self.signature = ObjectHash::from_stream(&mut reader).unwrap();
-
-    //     if render_hash != self.signature {
-    //         return Err(GitError::InvalidPackFile(format!(
-    //             "The pack file hash {} does not match the trailer hash {}",
-    //             render_hash, self.signature
-    //         )));
-    //     }
-
-    //     let end = utils::is_eof(&mut reader);
-    //     if !end {
-    //         return Err(GitError::InvalidPackFile(
-    //             "The pack file is not at the end".to_string(),
-    //         ));
-    //     }
-
-    //     self.pool.join(); // wait for all threads to finish
-
-    //     // send pack id for metadata
-    //     if let Some(pack_callback) = pack_id_callback {
-    //         pack_callback(self.signature);
-    //     }
-    //     // !Attention: Caches threadpool may not stop, but it's not a problem (garbage file data)
-    //     // So that files != self.number
-    //     assert_eq!(self.waitlist.map_offset.len(), 0);
-    //     assert_eq!(self.waitlist.map_ref.len(), 0);
-    //     // Because we may skip some objects (e.g. AI objects), we use >= instead of ==
-    //     assert!(self.number >= caches.total_inserted());
-    //     tracing::info!(
-    //         "The pack file has been decoded successfully, takes: [ {:?} ]",
-    //         time.elapsed()
-    //     );
-    //     self.caches.clear(); // clear cached objects & stop threads
-    //     assert_eq!(self.cache_objs_mem_used(), 0); // all the objs should be dropped until here
-
-    //     // impl in Drop Trait
-    //     // if self.clean_tmp {
-    //     //     self.caches.remove_tmp_dir();
-    //     // }
-
-    //     Ok(())
+    // CacheObjects + Index size of Caches
+    // fn memory_used(&self) -> usize {
+    //     self.cache_objs_mem_used() + self.caches.memory_used_index()
     // }
 
-    /// Decode a Pack in a new thread and send the CacheObjects while decoding.
-    /// <br> Attention: It will consume the `pack` and return in a JoinHandle.
+    //  The total memory used by the CacheObjects of this Pack
+    // fn cache_objs_mem_used(&self) -> usize {
+    //     self.cache_objs_mem.load(Ordering::Acquire)
+    // }
 
-    /// Decodes a `Pack` from a `Stream` of `Bytes`, and sends the `Entry` while decoding.
 
-    /// CacheObjects + Index size of Caches
-    fn memory_used(&self) -> usize {
-        self.cache_objs_mem_used() + self.caches.memory_used_index()
-    }
-
-    /// The total memory used by the CacheObjects of this Pack
-    fn cache_objs_mem_used(&self) -> usize {
-        self.cache_objs_mem.load(Ordering::Acquire)
-    }
-
-    /// Rebuild the Delta Object in a new thread & process the objects waiting for it recursively.
-    /// <br> This function must be *static*, because [&self] can't be moved into a new thread.
-    fn process_delta(
-        shared_params: Arc<SharedParams>,
-        delta_obj: CacheObject,
-        base_obj: Arc<CacheObject>,
-    ) {
-        shared_params.pool.clone().execute(move || {
-            let mut new_obj = match delta_obj.info {
-                CacheObjectInfo::OffsetDelta(_, _) | CacheObjectInfo::HashDelta(_, _) => {
-                    Pack::rebuild_delta(delta_obj, base_obj)
-                }
-                CacheObjectInfo::OffsetZstdelta(_, _) => {
-                    Pack::rebuild_zstdelta(delta_obj, base_obj)
-                }
-                _ => unreachable!(),
-            };
-
-            new_obj.set_mem_recorder(shared_params.cache_objs_mem_size.clone());
-            new_obj.record_mem_size();
-            Self::cache_obj_and_process_waitlist(shared_params, new_obj); //Indirect Recursion
-        });
-    }
-
-    /// Cache the new object & process the objects waiting for it (in multi-threading).
-    fn cache_obj_and_process_waitlist(shared_params: Arc<SharedParams>, new_obj: CacheObject) {
-        (shared_params.callback)(new_obj.to_entry_metadata());
-        let new_obj = shared_params.caches.insert(
-            new_obj.offset,
-            new_obj.base_object_hash().unwrap(),
-            new_obj,
-        );
-        Self::process_waitlist(shared_params, new_obj);
-    }
-
-    fn process_waitlist(shared_params: Arc<SharedParams>, base_obj: Arc<CacheObject>) {
-        let wait_objs = shared_params
-            .waitlist
-            .take(base_obj.offset, base_obj.base_object_hash().unwrap());
-        for obj in wait_objs {
-            // Process the objects waiting for the new object(base_obj = new_obj)
-            Self::process_delta(shared_params.clone(), obj, base_obj.clone());
-        }
-    }
 
     /// Reconstruct the Delta Object based on the "base object"
     /// and return the new object.
@@ -862,5 +477,222 @@ impl Pack {
             is_delta_in_pack: delta_obj.is_delta_in_pack,
         } // Canonical form (Complete Object)
         // Memory recording will happen after this function returns. See `process_delta`
+    }
+
+    /// Decode a Pack in a new thread and send the CacheObjects while decoding.
+    /// <br> Attention: It will consume the `pack` and return in a JoinHandle.
+    pub fn decode_async(
+        mut self,
+        mut pack: impl BufRead + Send + Seek + 'static,
+        sender: UnboundedSender<Entry>,
+    ) -> JoinHandle<Pack> {
+        let kind = get_hash_kind();
+        thread::spawn(move || {
+            set_hash_kind(kind);
+            self.decode(
+                &mut pack,
+                move |entry| {
+                    if let Err(e) = sender.send(entry.inner) {
+                        eprintln!("Channel full, failed to send entry: {e:?}");
+                    }
+                },
+                None::<fn(ObjectHash)>,
+            )
+            .unwrap();
+            self
+        })
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        io::{BufReader, Cursor, prelude::*},
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use flate2::{Compression, write::ZlibEncoder};
+    use futures_util::TryStreamExt;
+    use tokio_util::io::ReaderStream;
+
+    use crate::{
+        hash::{HashKind, ObjectHash, set_hash_kind_for_test},
+        internal::pack::{Pack, test_pack_download::download_pack_file, tests::init_logger},
+    };
+
+    #[tokio::test]
+    async fn test_pack_check_header() {
+        let (source, _guard) = download_pack_file("medium-sha1.pack");
+
+        let f = fs::File::open(source).unwrap();
+        let mut buf_reader = BufReader::new(f);
+        let (object_num, _) = Pack::check_header(&mut buf_reader).unwrap();
+
+        assert_eq!(object_num, 35031);
+    }
+
+
+    /// Helper function to run decode tests without delta objects
+    fn run_decode_no_delta(filename: &str, kind: HashKind) {
+        let _guard = set_hash_kind_for_test(kind);
+        let (source, _dl_guard) = download_pack_file(filename);
+
+        let tmp = PathBuf::from("/tmp/.cache_temp");
+
+        let f = fs::File::open(source).unwrap();
+        let mut buffered = BufReader::new(f);
+        let mut p = Pack::new(None, Some(1024 * 1024 * 20), Some(tmp), true);
+        p.decode(&mut buffered, |_| {}, None::<fn(ObjectHash)>)
+            .unwrap();
+    }
+    #[test]
+    fn test_pack_decode_without_delta() {
+        run_decode_no_delta("small-sha1.pack", HashKind::Sha1);
+        run_decode_no_delta("small-sha256.pack", HashKind::Sha256);
+    }
+
+    /// Helper function to run decode tests with delta objects
+    fn run_decode_with_ref_delta(filename: &str, kind: HashKind) {
+        let _guard = set_hash_kind_for_test(kind);
+        init_logger();
+
+        let (source, _dl_guard) = download_pack_file(filename);
+
+        let tmp = PathBuf::from("/tmp/.cache_temp");
+
+        let f = fs::File::open(source).unwrap();
+        let mut buffered = BufReader::new(f);
+        let mut p = Pack::new(None, Some(1024 * 1024 * 20), Some(tmp), true);
+        p.decode(&mut buffered, |_| {}, None::<fn(ObjectHash)>)
+            .unwrap();
+    }
+    #[test]
+    fn test_pack_decode_with_ref_delta() {
+        run_decode_with_ref_delta("ref-delta-sha1.pack", HashKind::Sha1);
+        run_decode_with_ref_delta("ref-delta-sha256.pack", HashKind::Sha256);
+    }
+
+    /// Helper function to run decode tests without memory limit
+    fn run_decode_no_mem_limit(filename: &str, kind: HashKind) {
+        let _guard = set_hash_kind_for_test(kind);
+        let (source, _dl_guard) = download_pack_file(filename);
+
+        let tmp = PathBuf::from("/tmp/.cache_temp");
+
+        let f = fs::File::open(source).unwrap();
+        let mut buffered = BufReader::new(f);
+        let mut p = Pack::new(None, None, Some(tmp), true);
+        p.decode(&mut buffered, |_| {}, None::<fn(ObjectHash)>)
+            .unwrap();
+    }
+    #[test]
+    fn test_pack_decode_no_mem_limit() {
+        run_decode_no_mem_limit("small-sha1.pack", HashKind::Sha1);
+        run_decode_no_mem_limit("small-sha256.pack", HashKind::Sha256);
+    }
+
+    /// Helper function to run decode tests with delta objects
+    async fn run_decode_large_with_delta(filename: &str, kind: HashKind) {
+        let _guard = set_hash_kind_for_test(kind);
+        init_logger();
+        let (source, _dl_guard) = download_pack_file(filename);
+
+        let tmp = PathBuf::from("/tmp/.cache_temp");
+
+        let f = fs::File::open(source).unwrap();
+        let mut buffered = BufReader::new(f);
+        let mut p = Pack::new(
+            Some(4),
+            Some(1024 * 1024 * 100), //try to avoid dead lock on CI servers with low memory
+            Some(tmp.clone()),
+            true,
+        );
+        let rt = p.decode(
+            &mut buffered,
+            |_obj| {
+                // println!("{:?} {}", obj.hash.to_string(), offset);
+            },
+            None::<fn(ObjectHash)>,
+        );
+        if let Err(e) = rt {
+            fs::remove_dir_all(tmp).unwrap();
+            panic!("Error: {e:?}");
+        }
+    }
+    #[tokio::test]
+    async fn test_pack_decode_with_large_file_with_delta_without_ref() {
+        run_decode_large_with_delta("medium-sha1.pack", HashKind::Sha1).await;
+        run_decode_large_with_delta("medium-sha256.pack", HashKind::Sha256).await;
+    } // it will be stuck on dropping `Pack` on Windows if `mem_size` is None, so we need `mimalloc`
+
+    /// Helper function to run decode tests with large file stream
+
+    /// Helper function to run decode tests with large file async
+    async fn run_decode_large_file_async(filename: &str, kind: HashKind) {
+        let _guard = set_hash_kind_for_test(kind);
+        let (source, _dl_guard) = download_pack_file(filename);
+
+        let tmp = PathBuf::from("/tmp/.cache_temp");
+        let f = fs::File::open(source).unwrap();
+        let buffered = BufReader::new(f);
+        let p = Pack::new(Some(4), Some(1024 * 1024 * 100), Some(tmp.clone()), true);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = p.decode_async(buffered, tx); // new thread
+        let mut cnt = 0;
+        while let Some(_entry) = rx.recv().await {
+            cnt += 1; //use entry here
+        }
+        let p = handle.join().unwrap();
+        assert_eq!(cnt, p.number);
+    }
+    #[tokio::test]
+    async fn test_decode_large_file_async() {
+        run_decode_large_file_async("medium-sha1.pack", HashKind::Sha1).await;
+        run_decode_large_file_async("medium-sha256.pack", HashKind::Sha256).await;
+    }
+
+    /// Helper function to run decode tests with delta objects without reference
+    fn run_decode_with_delta_no_ref(filename: &str, kind: HashKind) {
+        let _guard = set_hash_kind_for_test(kind);
+        let (source, _dl_guard) = download_pack_file(filename);
+
+        let tmp = PathBuf::from("/tmp/.cache_temp");
+
+        let f = fs::File::open(source).unwrap();
+        let mut buffered = BufReader::new(f);
+        let mut p = Pack::new(None, Some(1024 * 1024 * 20), Some(tmp), true);
+        p.decode(&mut buffered, |_| {}, None::<fn(ObjectHash)>)
+            .unwrap();
+    }
+    #[test]
+    fn test_pack_decode_with_delta_without_ref() {
+        run_decode_with_delta_no_ref("medium-sha1.pack", HashKind::Sha1);
+        run_decode_with_delta_no_ref("medium-sha256.pack", HashKind::Sha256);
+    }
+
+    #[test] // Take too long time
+    fn test_pack_decode_multi_task_with_large_file_with_delta_without_ref() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            // For each hash kind, run two decode tasks concurrently to simulate multi-task pressure.
+            for (kind, filename) in [
+                (HashKind::Sha1, "medium-sha1.pack"),
+                (HashKind::Sha256, "medium-sha256.pack"),
+            ] {
+                let f1 = run_decode_large_with_delta(filename, kind);
+                let f2 = run_decode_large_with_delta(filename, kind);
+                let _ = futures::future::join(f1, f2).await;
+            }
+        });
     }
 }

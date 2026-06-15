@@ -3,7 +3,7 @@
 
 pub mod cache;
 pub mod cache_object;
-pub mod channel_reader;
+// pub mod channel_reader;
 pub mod decode;
 pub mod encode;
 pub mod entry;
