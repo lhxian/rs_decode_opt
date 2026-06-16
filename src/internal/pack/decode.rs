@@ -504,12 +504,7 @@ impl Pack {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        io::BufReader,
-        path::PathBuf,
-    };
-
+    use std::{fs, io::BufReader, path::PathBuf};
 
     use crate::{
         hash::{HashKind, ObjectHash, set_hash_kind_for_test},
@@ -619,7 +614,6 @@ mod tests {
         run_decode_large_with_delta("medium-sha1.pack", HashKind::Sha1).await;
         run_decode_large_with_delta("medium-sha256.pack", HashKind::Sha256).await;
     } // it will be stuck on dropping `Pack` on Windows if `mem_size` is None, so we need `mimalloc`
-
 
     /// Helper function to run decode tests with large file async
     async fn run_decode_large_file_async(filename: &str, kind: HashKind) {
