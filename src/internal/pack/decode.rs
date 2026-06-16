@@ -2,13 +2,16 @@
 //! and populates caches/metadata for downstream consumers.
 
 use std::{
-    // collections::HashMap, 
-    io::{BufRead, Cursor, ErrorKind, Read, Seek}, path::PathBuf, sync::{
-        Arc, 
+    // collections::HashMap,
+    io::{BufRead, Cursor, ErrorKind, Read, Seek},
+    path::PathBuf,
+    sync::{
+        Arc,
         // Mutex,
-        atomic::{AtomicUsize},
-    }, thread::{self, JoinHandle}, 
-    // time::Instant, 
+        atomic::AtomicUsize,
+    },
+    thread::{self, JoinHandle},
+    // time::Instant,
     // usize
 };
 
@@ -28,14 +31,15 @@ use crate::{
         metadata::{EntryMeta, MetaAttached},
         // object::types::ObjectType,
         pack::{
-            DEFAULT_TMP_DIR, Pack,
+            DEFAULT_TMP_DIR,
+            Pack,
             cache::{_Cache, Caches},
             cache_object::{CacheObject, CacheObjectInfo},
             entry::Entry,
-            utils,
-            waitlist::Waitlist,
             // wrapper::Wrapper,
             graph::DependGraph,
+            utils,
+            waitlist::Waitlist,
         },
     },
     // utils::CountingReader,
@@ -77,7 +81,6 @@ use crate::{
 //     pub cache_objs_mem_size: Arc<AtomicUsize>,
 //     pub callback: Arc<dyn Fn(MetaAttached<Entry, EntryMeta>) + Sync + Send>,
 // }
-
 
 impl Drop for Pack {
     fn drop(&mut self) {
@@ -233,11 +236,9 @@ impl Pack {
         }
     }
 
-
-    
     // my_decode
     /// Decodes a `Pack` from a `Stream` of `Bytes`, and sends the `Entry` while decoding.
-    pub fn decode<F,C>(
+    pub fn decode<F, C>(
         &mut self,
         pack: &mut (impl BufRead + Send + Seek),
         callback: F,
@@ -267,8 +268,8 @@ impl Pack {
         for _ in 0..self.pool.max_count() {
             // make value
             let task_graph = graph.clone();
-            let task_callback =shared_callback.clone();
-            let task_caches= self.caches.clone();
+            let task_callback = shared_callback.clone();
+            let task_caches = self.caches.clone();
 
             // for test
             // let task_count = arc_shared_count.clone();
@@ -280,52 +281,52 @@ impl Pack {
                 // let mut no_cache_cnt: usize =0;
                 // let mut remove_cache_cnt: usize =0;
 
-                let mut direct_fall: usize =usize::MAX;
-                loop{
+                let mut direct_fall: usize = usize::MAX;
+                loop {
                     let consume_index = if direct_fall != usize::MAX {
-                        let res =Some(direct_fall);
+                        let res = Some(direct_fall);
                         direct_fall = usize::MAX; // set
                         res
-                    }else {
+                    } else {
                         task_graph.take_idx()
                     };
                     match consume_index {
                         Some(idx) => {
                             // cnt += 1;
                             let cache_obj = task_graph.take(idx);
-                            let target_obj =match cache_obj.info {
-                                CacheObjectInfo::BaseObject(_,_ ) => cache_obj,
-                                CacheObjectInfo::OffsetDelta(base_offset, _)  => {
+                            let target_obj = match cache_obj.info {
+                                CacheObjectInfo::BaseObject(_, _) => cache_obj,
+                                CacheObjectInfo::OffsetDelta(base_offset, _) => {
                                     let base_obj = task_caches.get_by_offset(base_offset).unwrap();
-                                     Pack::rebuild_delta(cache_obj,base_obj)
+                                    Pack::rebuild_delta(cache_obj, base_obj)
                                 }
-                                CacheObjectInfo::OffsetZstdelta(base_offset,_ ) =>{
+                                CacheObjectInfo::OffsetZstdelta(base_offset, _) => {
                                     let base_obj = task_caches.get_by_offset(base_offset).unwrap();
-                                    Pack::rebuild_zstdelta(cache_obj,base_obj)
+                                    Pack::rebuild_zstdelta(cache_obj, base_obj)
                                 }
                                 CacheObjectInfo::HashDelta(base_ref, _) => {
                                     let base_obj = task_caches.get_by_hash(base_ref).unwrap();
-                                    Pack::rebuild_delta(cache_obj,base_obj)
+                                    Pack::rebuild_delta(cache_obj, base_obj)
                                 }
                             };
                             // apply callback to target object
                             task_callback(target_obj.to_entry_metadata());
                             // check ref delta
-                            let oid=  match &target_obj.info {
-                                CacheObjectInfo::BaseObject(_,oid) => oid,
-                                _ => unreachable!()
+                            let oid = match &target_obj.info {
+                                CacheObjectInfo::BaseObject(_, oid) => oid,
+                                _ => unreachable!(),
                             };
-                            let offset= target_obj.offset;
+                            let offset = target_obj.offset;
                             // lock the work list and decide whether to cache the object
                             {
                                 let mut work_list = task_graph.work_list.lock().unwrap();
-                                let (first_child ,_)= task_graph.take_child(idx, oid,&mut work_list);
+                                let (first_child, _) =
+                                    task_graph.take_child(idx, oid, &mut work_list);
                                 match first_child {
                                     Some(child) => {
                                         // cache
                                         direct_fall = child;
-                                        task_caches.insert(offset,*oid,target_obj);
-
+                                        task_caches.insert(offset, *oid, target_obj);
                                     }
                                     None => {
                                         // no_cache_cnt += 1;
@@ -333,12 +334,12 @@ impl Pack {
                                 }
                             }
                             // check parent or eliminate
-                            let (parent_idx ,parent_offset)= task_graph.get_parent_index_and_offset(idx) ;
-                            if parent_idx != -1 && task_graph.dec_ref(parent_idx as usize){
+                            let (parent_idx, parent_offset) =
+                                task_graph.get_parent_index_and_offset(idx);
+                            if parent_idx != -1 && task_graph.dec_ref(parent_idx as usize) {
                                 task_caches.remove_by_offset(parent_offset);
                                 // remove_cache_cnt +=1;
                             }
-
                         }
                         None => {
                             break;
@@ -363,9 +364,6 @@ impl Pack {
         Ok(())
     }
 
-
-
-
     // CacheObjects + Index size of Caches
     // fn memory_used(&self) -> usize {
     //     self.cache_objs_mem_used() + self.caches.memory_used_index()
@@ -375,8 +373,6 @@ impl Pack {
     // fn cache_objs_mem_used(&self) -> usize {
     //     self.cache_objs_mem.load(Ordering::Acquire)
     // }
-
-
 
     /// Reconstruct the Delta Object based on the "base object"
     /// and return the new object.
@@ -504,24 +500,16 @@ impl Pack {
             self
         })
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
         fs,
-        io::{BufReader, Cursor, prelude::*},
+        io::BufReader,
         path::PathBuf,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
     };
 
-    use flate2::{Compression, write::ZlibEncoder};
-    use futures_util::TryStreamExt;
-    use tokio_util::io::ReaderStream;
 
     use crate::{
         hash::{HashKind, ObjectHash, set_hash_kind_for_test},
@@ -538,7 +526,6 @@ mod tests {
 
         assert_eq!(object_num, 35031);
     }
-
 
     /// Helper function to run decode tests without delta objects
     fn run_decode_no_delta(filename: &str, kind: HashKind) {
@@ -633,7 +620,6 @@ mod tests {
         run_decode_large_with_delta("medium-sha256.pack", HashKind::Sha256).await;
     } // it will be stuck on dropping `Pack` on Windows if `mem_size` is None, so we need `mimalloc`
 
-    /// Helper function to run decode tests with large file stream
 
     /// Helper function to run decode tests with large file async
     async fn run_decode_large_file_async(filename: &str, kind: HashKind) {

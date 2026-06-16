@@ -36,10 +36,10 @@ fn main() {
         |entry| {
             // Callback function: process each decoded object (Entry)
             // entry.inner contains the actual data, entry.meta contains metadata
-            // println!(
-            //     "Decoded object: {} | Type: {:?}",
-            //     entry.inner.hash, entry.inner.obj_type
-            // );
+            println!(
+                "Decoded object: {} | Type: {:?}",
+                entry.inner.hash, entry.inner.obj_type
+            );
         },
         None::<fn(ObjectHash)>, // Optional: callback for the overall Pack file Hash
     )

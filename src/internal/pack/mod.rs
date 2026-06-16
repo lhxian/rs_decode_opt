@@ -7,12 +7,12 @@ pub mod cache_object;
 pub mod decode;
 pub mod encode;
 pub mod entry;
+pub mod graph;
 mod index_entry;
 pub mod pack_index;
 pub mod utils;
 pub mod waitlist;
 pub mod wrapper;
-pub mod graph;
 use std::sync::{Arc, atomic::AtomicUsize};
 
 use threadpool::ThreadPool;
