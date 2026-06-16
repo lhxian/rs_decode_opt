@@ -13,3 +13,4 @@ examples/output_packs/buck-out
 work
 log.txt
 info.txt
+examples/grading_bot_decode_pack_bench.rs
